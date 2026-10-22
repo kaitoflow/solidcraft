@@ -42,6 +42,7 @@ fn merge_preview_retains_interfaces_in_an_independent_native_candidate() {
     assert_eq!(result["status"], "merged");
     assert_eq!(result["source_faces"], 32);
     assert_eq!(result["candidate_faces"], 17);
+    assert_eq!(result["input_boundary_tolerance_mm"], 0.0);
     assert_eq!(result["protected_face_mapping"].as_array().unwrap().len(), 8);
     assert_eq!(s.doc.to_json(), before);
     assert_eq!(result["design_modified"], false);
@@ -92,6 +93,9 @@ fn merge_preview_blocks_unknown_roles_and_rejects_stale_or_bad_selections() {
         json!({"body":name,"geometry_key":key,"protection":"explicit_faces","protected_faces":[9999]}),
         json!({"body":"missing","geometry_key":key,"protection":"explicit_faces","protected_faces":[0]}),
         json!({"body":name,"geometry_key":key,"protection":"explicit_faces","protected_faces":[0],"apply":true}),
+        json!({"body":name,"geometry_key":key,"protection":"explicit_faces","protected_faces":[0],"input_boundary_tolerance_mm":-1}),
+        json!({"body":name,"geometry_key":key,"protection":"explicit_faces","protected_faces":[0],"input_boundary_tolerance_mm":0.0101}),
+        json!({"body":name,"geometry_key":key,"protection":"explicit_faces","protected_faces":[0],"input_boundary_tolerance_mm":null}),
     ] {
         assert!(s.execute("thermal.merge_coplanar_preview", &value).is_err(), "{value}");
         assert_eq!(s.doc.to_json(), before);
@@ -105,9 +109,10 @@ fn merge_preview_blocks_unknown_roles_and_rejects_stale_or_bad_selections() {
     let reduced = run(
         &mut s,
         "thermal.merge_coplanar_preview",
-        json!({"body":name,"geometry_key":key,"protection":"explicit_faces","protected_faces":[],"allow_empty_protection":true}),
+        json!({"body":name,"geometry_key":key,"protection":"explicit_faces","protected_faces":[],"allow_empty_protection":true,"input_boundary_tolerance_mm":1e-6}),
     );
     assert_eq!(reduced["candidate_faces"], 10);
+    assert_eq!(reduced["input_boundary_tolerance_mm"], 1e-6);
     assert_eq!(s.doc.to_json(), before);
 }
 

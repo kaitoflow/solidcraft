@@ -96,6 +96,10 @@ pub struct MergePreviewParams {
     /// Include bounded, producer-specific native geometry for a separate candidate consumer.
     #[serde(default)]
     pub include_native: bool,
+    /// Explicit allowance for existing Line boundary/support inconsistency in mm,0..0.01.
+    /// Default0 retains machine-arithmetic checks; it does not relax plane recognition.
+    #[serde(default)]
+    pub input_boundary_tolerance_mm: f64,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -129,4 +133,6 @@ pub struct MergePreview {
     pub candidate_encoding: Option<String>,
     /// STEP interchange is checked separately by a fixed export/reopen runner.
     pub step_interchange_check: String,
+    pub input_boundary_tolerance_mm: f64,
+    pub max_merged_group_boundary_error_mm: Option<f64>,
 }

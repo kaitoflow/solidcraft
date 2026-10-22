@@ -34,7 +34,7 @@ pub static COMMANDS: &[CommandSpec] = &[CommandSpec::new(ID, "Plan Thermal Envel
         .noundo()
         .contract(&MERGE_CONTRACT)
         .output(crate::schema::output_schema_for::<MergePreview>)
-        .params("body: exact world placement; geometry_key: current session key; protection: unconfirmed|whole_body|explicit_faces; protected_faces: distinct current indices; allow_empty_protection?: false; include_native?: false. Read-only polygonal coplanar candidate; source and undo unchanged, unknown interfaces protected as a whole."),
+        .params("body: exact world placement; geometry_key: current session key; protection: unconfirmed|whole_body|explicit_faces; protected_faces: distinct current indices; allow_empty_protection?: false; include_native?: false; input_boundary_tolerance_mm?: finite 0..0.01 (default0). Explicit allowance for existing linear support/trim inconsistency, without moving geometry or relaxing plane recognition. Read-only polygonal coplanar candidate; source and undo unchanged, unknown interfaces protected as a whole."),
 ];
 
 fn xyz(v: Vec3) -> [f64; 3] {
@@ -177,6 +177,9 @@ fn envelope_plan(s: &mut Session, raw: &Value) -> Result<Value> {
 
 fn merge_preview(s: &mut Session, raw: &Value) -> Result<Value> {
     let params: MergePreviewParams = serde_json::from_value(raw.clone()).map_err(|e| bad(MERGE_ID, e.to_string()))?;
+    if !params.input_boundary_tolerance_mm.is_finite() || !(0.0..=0.01).contains(&params.input_boundary_tolerance_mm) {
+        return Err(bad(MERGE_ID, "input_boundary_tolerance_mm must be finite within0..0.01mm"));
+    }
     if params.body.trim().is_empty()
         || params.body.len() > 1024
         || params.geometry_key.len() != 16
@@ -221,6 +224,8 @@ fn merge_preview(s: &mut Session, raw: &Value) -> Result<Value> {
         candidate_native_hex: None,
         candidate_encoding: None,
         step_interchange_check: "not_run".into(),
+        input_boundary_tolerance_mm: params.input_boundary_tolerance_mm,
+        max_merged_group_boundary_error_mm: None,
     };
     match params.protection {
         InterfaceProtection::Unconfirmed => result.blocked_reasons.push("unconfirmed_interfaces_protect_whole_body".into()),
@@ -229,7 +234,11 @@ fn merge_preview(s: &mut Session, raw: &Value) -> Result<Value> {
             if params.protected_faces.is_empty() && !params.allow_empty_protection {
                 return Err(bad(MERGE_ID, "empty protection requires explicit allow_empty_protection"));
             }
-            let preview = body.body.merge_coplanar_preview(&params.protected_faces).map_err(|e| bad(MERGE_ID, e.to_string()))?;
+            let preview = body
+                .body
+                .merge_coplanar_preview_with_input_tolerance(&params.protected_faces, params.input_boundary_tolerance_mm)
+                .map_err(|e| bad(MERGE_ID, e.to_string()))?;
+            result.max_merged_group_boundary_error_mm = Some(preview.max_merged_group_boundary_error_mm);
             result.status = if preview.changed { "merged" } else { "unchanged" }.into();
             result.candidate_faces = Some(preview.body.face_count());
             result.source_volume_mm3 = Some(preview.source_volume_mm3);

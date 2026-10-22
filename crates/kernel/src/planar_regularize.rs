@@ -17,24 +17,65 @@ fn root(parent: &mut [usize], mut i: usize) -> usize {
 }
 
 fn merged_face(faces: &[&mt::Face], members: &[usize], plane: Plane, eligible: &HashSet<mt::EdgeID>) -> Option<mt::Face> {
+    merged_face_with_input_tolerance(faces, members, plane, eligible, 0.)
+}
+
+#[derive(Default)]
+struct LineSupportCheck {
+    maximum_height_mm: f64,
+    maximum_endpoint_mm: f64,
+    /// First failed edge: face index, edge ordinal, kind, error, arithmetic budget.
+    violation: Option<(usize, usize, &'static str, f64, f64)>,
+}
+
+impl LineSupportCheck {
+    fn maximum(&self) -> f64 {
+        self.maximum_height_mm.max(self.maximum_endpoint_mm)
+    }
+}
+
+/// Existing support and trim geometry is observed, never fitted or moved.
+fn line_support_check(faces: &[&mt::Face], members: &[usize], plane: Plane, input_tolerance_mm: f64) -> Option<LineSupportCheck> {
+    let mut check = LineSupportCheck::default();
+    for i in members {
+        for (ordinal, edge) in faces.get(*i)?.boundary_iters().into_iter().flatten().enumerate() {
+            let mt::Curve::Line(line) = edge.curve() else { return None };
+            let (a, b) = (from_p3(line.0), from_p3(line.1));
+            let (front, back) = (from_p3(edge.absolute_front().point()), from_p3(edge.absolute_back().point()));
+            if !a.is_finite() || !b.is_finite() || !front.is_finite() || !back.is_finite() || a.len().max(b.len()) > 1e9 {
+                return None;
+            }
+            let height = plane.height(a).abs().max(plane.height(b).abs());
+            let endpoint = a.dist(front).max(b.dist(back));
+            let arithmetic = 4096. * f64::EPSILON * (1. + a.len() + b.len() + plane.origin.len());
+            if !height.is_finite() || !endpoint.is_finite() || !arithmetic.is_finite() {
+                return None;
+            }
+            check.maximum_height_mm = check.maximum_height_mm.max(height);
+            check.maximum_endpoint_mm = check.maximum_endpoint_mm.max(endpoint);
+            for (kind, error) in [("off_support_height", height), ("endpoint_vertex_mismatch", endpoint)] {
+                if check.violation.is_none() && error > arithmetic.max(input_tolerance_mm) {
+                    check.violation = Some((*i, ordinal, kind, error, arithmetic));
+                }
+            }
+        }
+    }
+    Some(check)
+}
+
+fn merged_face_with_input_tolerance(
+    faces: &[&mt::Face],
+    members: &[usize],
+    plane: Plane,
+    eligible: &HashSet<mt::EdgeID>,
+    input_tolerance_mm: f64,
+) -> Option<mt::Face> {
+    if line_support_check(faces, members, plane, input_tolerance_mm)?.violation.is_some() {
+        return None;
+    }
     let mut counts = HashMap::<mt::EdgeID, (usize, bool)>::new();
     for i in members {
         for edge in faces.get(*i)?.boundary_iters().into_iter().flatten() {
-            // Whole linear supports, not a sampled plane fit.
-            let mt::Curve::Line(line) = edge.curve() else { return None };
-            let (a, b) = (from_p3(line.0), from_p3(line.1));
-            if !a.is_finite() || !b.is_finite() || a.len().max(b.len()) > 1e9 {
-                return None;
-            }
-            let front = from_p3(edge.absolute_front().point());
-            let back = from_p3(edge.absolute_back().point());
-            if !front.is_finite() || !back.is_finite() {
-                return None;
-            }
-            let error = 4096. * f64::EPSILON * (1. + a.len() + b.len() + plane.origin.len());
-            if plane.height(a).abs() > error || plane.height(b).abs() > error || a.dist(front) > error || b.dist(back) > error {
-                return None;
-            }
             let count = counts.entry(edge.id()).or_insert((0, edge.orientation()));
             if count.0 == 1 && (!eligible.contains(&edge.id()) || count.1 == edge.orientation()) {
                 return None;
@@ -334,6 +375,8 @@ pub struct CoplanarMergePreview {
     pub source_volume_mm3: f64,
     pub candidate_volume_mm3: f64,
     pub relative_volume_delta: f64,
+    pub input_boundary_tolerance_mm: f64,
+    pub max_merged_group_boundary_error_mm: f64,
 }
 
 impl Body {
@@ -342,7 +385,20 @@ impl Body {
     /// Existing authored split lines also veto internal-edge removal, including bypass paths.
     /// An attempted group that cannot be rebuilt is an error, distinct from no eligible group.
     pub fn merge_coplanar_preview(&self, protected_faces: &[usize]) -> Result<CoplanarMergePreview> {
+        self.merge_coplanar_preview_with_input_tolerance(protected_faces, 0.)
+    }
+
+    /// Explicit input-boundary consistency allowance, 0..0.01 mm. Plane recognition and
+    /// protected geometry remain unchanged; zero preserves the strict arithmetic policy.
+    pub fn merge_coplanar_preview_with_input_tolerance(
+        &self,
+        protected_faces: &[usize],
+        input_boundary_tolerance_mm: f64,
+    ) -> Result<CoplanarMergePreview> {
         let invalid = |reason: &str| crate::KernelError::Invalid(format!("coplanar preview: {reason}"));
+        if !input_boundary_tolerance_mm.is_finite() || !(0.0..=0.01).contains(&input_boundary_tolerance_mm) {
+            return Err(invalid("input boundary tolerance must be finite and between0and0.01mm"));
+        }
         if self.is_mesh() || self.shell_count() != 1 || self.face_count() > 1024 || self.face_count() == 0 || protected_faces.len() > 1024 {
             return Err(invalid("requires one B-rep shell with 1..1024 faces"));
         }
@@ -420,6 +476,7 @@ impl Body {
             let mut output = Vec::new();
             let mut lineage = Vec::new();
             let mut source_metadata = Vec::new();
+            let mut maximum_input_error = 0.0_f64;
             for members in groups.values() {
                 let first = *members.first().ok_or_else(|| invalid("empty face group"))?;
                 let face = if members.len() == 1 {
@@ -430,7 +487,16 @@ impl Body {
                     {
                         return Err(invalid("group exceeds common support accuracy"));
                     }
-                    merged_face(&faces, members, plane, &eligible)
+                    let check = line_support_check(&faces, members, plane, input_boundary_tolerance_mm)
+                        .ok_or_else(|| invalid("merged group has invalid line supports"))?;
+                    maximum_input_error = maximum_input_error.max(check.maximum());
+                    if let Some((face, edge, kind, error, arithmetic)) = check.violation {
+                        return Err(invalid(&format!(
+                            "input boundary kind={kind} face={face} edge={edge} error_mm={error:.9e} arithmetic_mm={arithmetic:.9e} explicit_mm={input_boundary_tolerance_mm:.9e} max_height_mm={:.9e} max_endpoint_mm={:.9e}",
+                            check.maximum_height_mm, check.maximum_endpoint_mm
+                        )));
+                    }
+                    merged_face_with_input_tolerance(&faces, members, plane, &eligible, input_boundary_tolerance_mm)
                         .ok_or_else(|| invalid("attempted merge cannot retain closed outer, hole and authored boundaries"))?
                 };
                 output.push(face);
@@ -502,6 +568,8 @@ impl Body {
                 source_volume_mm3: measured.volume,
                 candidate_volume_mm3: after.volume,
                 relative_volume_delta,
+                input_boundary_tolerance_mm,
+                max_merged_group_boundary_error_mm: maximum_input_error,
             })
         })
     }
@@ -577,6 +645,56 @@ mod tests {
         assert_eq!(reopened.face_count(), 10);
         assert_eq!(crate::encode_native_body(&reopened).unwrap(), native);
         assert_eq!(crate::encode_native_body(&input).unwrap(), before, "source is unchanged");
+    }
+
+    #[test]
+    fn coplanar_preview_input_allowance_is_explicit_bounded_and_preserves_holes() {
+        let source = tiled_plate(true);
+        // Imported support planes can differ slightly from unchanged trim vertices.
+        let faces: Vec<_> = source
+            .solid
+            .face_iter()
+            .map(|face| {
+                if super::super::planar_sources::actual_plane(face).is_some_and(|p| p.normal().z > 0.9) {
+                    let mt::Surface::Plane(original) = face.surface() else { panic!("analytic plane") };
+                    let origin = original.origin() + mt::Vector3::new(0., 0., 1e-7);
+                    let surface = mt::Surface::Plane(mt::Plane::new(origin, origin + original.u_axis(), origin + original.v_axis()));
+                    let mut replacement = mt::Face::try_new(face.absolute_boundaries().clone(), surface).unwrap();
+                    if !face.orientation() {
+                        replacement.invert();
+                    }
+                    replacement
+                } else {
+                    face.clone()
+                }
+            })
+            .collect();
+        let input =
+            Body::new_placed(mt::Solid::try_new(vec![mt::Shell::from(faces)]).unwrap(), false, None, true).unwrap().with_boundary_tol(Some(1e-6));
+        let protected = input
+            .solid
+            .face_iter()
+            .enumerate()
+            .find_map(|(i, f)| super::super::planar_sources::actual_plane(f).filter(|p| p.origin.x == 1. && p.normal().x > 0.9).map(|_| i))
+            .unwrap();
+        let original_id = input.solid.face_iter().nth(protected).unwrap().id();
+        let before = crate::encode_native_body(&input).unwrap();
+        let error = input.merge_coplanar_preview(&[protected]).unwrap_err().to_string();
+        assert!(error.contains("kind=off_support_height") && error.contains("max_endpoint_mm=0.000000000e0"), "{error}");
+        assert!(input.merge_coplanar_preview_with_input_tolerance(&[protected], 1e-8).is_err());
+        for budget in [-1., f64::NAN, f64::INFINITY, 0.0101] {
+            assert!(input.merge_coplanar_preview_with_input_tolerance(&[protected], budget).is_err());
+        }
+        let preview = input.merge_coplanar_preview_with_input_tolerance(&[protected], 1e-6).unwrap();
+        assert_eq!(preview.body.face_count(), 10);
+        assert_eq!(preview.input_boundary_tolerance_mm, 1e-6);
+        assert!((preview.max_merged_group_boundary_error_mm - 1e-7).abs() < 1e-14);
+        assert_eq!(preview.body.boundary_tol, input.boundary_tol);
+        assert!(preview.relative_volume_delta <= 1e-6);
+        assert!(!preview.body.contains(solidcraft_geom::Vec3::new(1.5, 1.5, 0.5)));
+        let (_, output_index) = preview.protected_faces[0];
+        assert_eq!(preview.body.solid.face_iter().nth(output_index).unwrap().id(), original_id);
+        assert_eq!(crate::encode_native_body(&input).unwrap(), before);
     }
 
     #[test]

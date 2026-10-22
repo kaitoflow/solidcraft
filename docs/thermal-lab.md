@@ -207,7 +207,7 @@ all surviving boundaries to an export copy before writing and checks the actual 
 file. The source geometry and its document are not modified. This is a local analytic
 demonstration; private same-part commercial CAD comparison remains a separate experiment.
 
-The local run passed the six focused planar topology tests and thirteen thermal command
+The local run passed seven focused planar topology tests and thirteen thermal command
 tests. The fixed example retained all eight protected regions after actual STEP export
 and independent reopen, with zero observed boundary-distance and volume differences on
 this analytic fixture. Before/after CLI CPU snapshots were generated and inspected.
@@ -220,6 +220,40 @@ Full CI was attempted again and stopped at the unchanged upstream geometry Clipp
 A kernel-only Clippy check also reported six existing `nonminimal_bool` errors in unchanged
 `coplanar.rs`, `curveblend.rs`, `ops.rs`, `step_in/brep.rs`, `tess/grid.rs` and `tess/seam.rs`.
 No unrelated fixes or lint suppressions were added.
+
+## Controlled coplanar input consistency
+
+The coplanar preview defaults to the existing machine-arithmetic boundary checks.
+An explicit `input_boundary_tolerance_mm` allows an existing straight-line support/trim
+inconsistency, within the command's hard bound of 0.01 mm. It neither fits nor moves
+vertices, curves or planes, and does not relax common-plane recognition, authored
+boundaries, protection identity, loop closure or volume checks. It does not raise the
+body's stored boundary tolerance. Legacy regularization callers remain fixed at zero.
+Use a separately justified input allowance, never the hard maximum as a recommended value.
+
+A strict refusal reports the first offending face and edge ordinal, support-height
+versus endpoint/vertex error, arithmetic and explicit budgets, and the group's maximum
+errors. Successful responses report the requested allowance and observed group error.
+
+```text
+cargo build --profile ci -p solidcraft-engine --example thermal_coplanar_probe --locked
+thermal_coplanar_probe.exe <six-plane.step> <new-absolute-private-output> <input-sha256> [frozen-common-sha256] [input-boundary-allowance-mm]
+```
+
+This fixed runner admits one valid six-plane quadrilateral body up to 1 MiB and creates
+two controlled seams on its largest face, producing an eight-face common STEP. The five
+non-target faces are protected. An initial zero-allowance run may create the common file
+without an expected digest. For comparison, freeze it and provide that same common digest
+to both strict and explicit-allowance runs. A nonzero allowance requires the digest, is
+limited to 1e-6 mm by this runner and
+must also fit the source uncertainty established by the private admission protocol.
+All six original face regions are checked before and after independent STEP reopening:
+unique centroid/normal/area matches, a single retained boundary loop, bidirectional
+boundary coverage, valid closed solid, volume and unchanged inputs. Only deliberately
+introduced collinear subdivisions may differ in segment count; raw counts are reported.
+Successful nonzero runs also require the observed boundary inconsistency to fit the
+explicit allowance. These are controlled subdivisions and geometric checks, without
+automatic engineering-role confirmation or thermal equivalence.
 
 ## Controlled local repair
 
