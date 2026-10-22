@@ -42,5 +42,6 @@ log = { workspace = true }
 web-time = { workspace = true }
 
 [dev-dependencies]
+sha2 = { workspace = true }
 # Normal CI exercises profiling assertions without enabling the production feature.
 solidcraft-sketch = { workspace = true, features = ["solver-profiling"] }

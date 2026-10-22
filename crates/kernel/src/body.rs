@@ -1737,6 +1737,24 @@ impl Body {
         out
     }
 
+    /// Whether all B-rep shells are nonempty, topologically closed and consistently oriented.
+    /// `None` means no B-rep shells were observed (an empty or mesh body). This reads edge
+    /// incidence only: it does not certify vertex manifoldness, surfaces, meshing, positive
+    /// volume or a valid solid. It is independent of a STEP file's shell declarations.
+    pub fn topology_closure(&self) -> Result<Option<bool>> {
+        if self.mesh.is_some() || self.solid.boundaries().is_empty() {
+            return Ok(None);
+        }
+        guard("observe shell closure", || {
+            Ok(Some(
+                self.solid
+                    .boundaries()
+                    .iter()
+                    .all(|shell| !shell.is_empty() && shell.shell_condition() == truck_topology::shell::ShellCondition::Closed),
+            ))
+        })
+    }
+
     pub fn shell_count(&self) -> usize {
         match &self.mesh {
             Some(_) => 1,

@@ -94,6 +94,68 @@ the same fixtures. Root README, product artwork and generated command inventorie
 unchanged. Development is on this fork; no upstream issue claim or pull request is required
 for the user's isolated experiment.
 
+## Private input diagnostic
+
+`thermal_import_probe` is an engine-only example for a separate, bounded comparison runner:
+
+```text
+cargo build --profile ci -p solidcraft-engine --example thermal_import_probe --locked
+thermal_import_probe.exe <absolute-input.step> <new-absolute-private-output> <input-sha256> [inventory-index,...]
+```
+
+It calls the registered `doc.open` path with unchanged source axes, inventories world
+placements, and records source hashes, import warnings, model errors, shell counts and
+observed topological closure. Input and reports must stay outside this public checkout.
+The caller must enforce process time and memory budgets; the example does not provide an
+operating-system sandbox. It admits STEP files up to 256 MiB and at most 20,000 placements.
+No application crash collector is installed. Existing output directories are refused.
+
+At most eight explicit inventory indices can request sampled measurement, face summaries,
+a 0.01 mm requested tessellation and a separate STEP export. The kernel may clamp meshing
+tolerances to its scale-dependent minimum. A face's area centroid can lie outside its trim;
+it is not automatically a point for a subsequent edit or a confirmed engineering interface.
+These observations do not repair, simplify or adopt any geometry.
+
+`Body::topology_closure` observes edge incidence independently of STEP shell declarations.
+Empty and mesh bodies return unknown; a nonempty B-rep whose shells are closed and
+consistently oriented returns true. This does not check vertex manifoldness, meshing,
+surface accuracy, positive volume or full solid validity. Import warnings remain intact:
+the importer's existing `closed` flag can be false for a source-declared surface model,
+even when this separate topological check passes. Warning count is not an open-body count.
+
+The fast inventory's outline bounds include spline control points and can extend far
+beyond the trimmed geometry, or miss a face that bulges past its boundary. Compare
+selected surface samples and a common world frame before interpreting box differences
+as displaced or missing parts. Shell count also differs from material-region count when
+a body contains disconnected pieces or cavities.
+
+## Controlled local repair
+
+```text
+cargo build --profile ci -p solidcraft-engine --example thermal_repair_probe --locked
+thermal_repair_probe.exe <single-body.step> <new-absolute-private-output> <input-sha256>
+```
+
+This fixed experiment admits one valid six-plane body up to 1 MiB with a four-edge target
+face. It clones the design, removes that face without healing, exports a common five-face
+STEP defect, independently opens that exact file, then runs the registered `surface.patch`
+and `surface.stitch` commands. It exports through `kernel.step_export` and independently
+reopens through `doc.open`.
+
+Success requires six faces before and after the final STEP round trip, valid closed solids,
+volume relative error at most 1e-6, and unique geometric matches for all six original faces.
+The five non-target faces and reconstructed face are checked before export and after reopen:
+centroid within 0.01 mm, planar normal within 0.1 degrees, area within 0.1%, equal boundary
+edge count, and bidirectional mesh-boundary sample distance within 0.01 mm. A failed check
+writes a failed report and returns a nonzero exit. These are sampled geometric criteria,
+not an exact B-rep certificate or confirmed engineering-interface classification.
+
+The source file/design and common-defect hash must remain unchanged. The source defect is
+deliberately created; a successful run does not establish repair of naturally damaged
+assembly geometry. The generic analytic envelope from `thermal_envelope_lab` can exercise
+the probe without company data. Private comparison inputs and results stay outside this
+checkout and its pull request.
+
 ## Initial validation record
 
 On Windows with Rust 1.95.0 and the existing MSVC build tools, the engine test binaries built

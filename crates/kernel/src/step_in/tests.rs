@@ -7,6 +7,20 @@ fn rel(a: f64, b: f64) -> f64 {
     (a - b).abs() / b.abs().max(1e-9)
 }
 
+#[test]
+fn observed_topology_closure_is_independent_of_step_shell_declaration() {
+    let entities =
+        cube_entities().replace("CLOSED_SHELL", "OPEN_SHELL").replace("MANIFOLD_SOLID_BREP('Cube',#100)", "SHELL_BASED_SURFACE_MODEL('Cube',(#100))");
+    let text = format!("{HEAD}{entities}#60=SHAPE_REPRESENTATION('',(#101),$);\n{TAIL}");
+    let imported = step_import(&text).unwrap();
+    assert_eq!(imported.bodies.len(), 1);
+    let body = imported.bodies.first().unwrap();
+    assert!(!body.closed, "the existing importer flag retains the source declaration");
+    assert_eq!(body.body.topology_closure().unwrap(), Some(true));
+    assert_eq!(body.body.face_count(), 6);
+    assert!(!imported.warnings.is_empty(), "observing closure does not suppress importer warnings");
+}
+
 /// A single spherical face bounded by one meridian edge used in both directions.
 /// `end_angle` is measured from the north pole toward the seam; PI is the south pole.
 fn seam_sphere_step(center: Vec3, radius: f64, axis: Vec3, reference: Vec3, azimuth: f64, reverse_edge: bool, end_angle: f64) -> String {
