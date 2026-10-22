@@ -86,6 +86,7 @@ mod surface;
 mod surface_analysis;
 mod surface_boundary;
 mod surface_match;
+mod thermal;
 mod view_dxf;
 mod view_navigation;
 
@@ -295,6 +296,7 @@ pub fn command_specs() -> Vec<&'static CommandSpec> {
     v.extend(file::COMMANDS.iter());
     v.extend(metadata::COMMANDS.iter());
     v.extend(inspect::COMMANDS.iter());
+    v.extend(thermal::COMMANDS.iter());
     v.extend(compare::COMMANDS.iter());
     v.extend(silhouette::COMMANDS.iter());
     v.extend(materials::COMMANDS.iter());
