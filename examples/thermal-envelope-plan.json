@@ -1,0 +1,8 @@
+{
+  "commands": [
+    {"command": "solid.box", "params": {"length": 40, "width": 20, "height": 4, "body_name": "Bracket"}},
+    {"command": "solid.box", "params": {"corner": [0, 0, 4], "length": 4, "width": 20, "height": 16, "operation": "join", "targets": ["Bracket"]}},
+    {"command": "solid.box", "params": {"corner": [60, 0, 0], "length": 10, "width": 20, "height": 1, "body_name": "ProtectedPlate"}},
+    {"command": "thermal.envelope_plan", "params": {"bodies": ["Bracket", "ProtectedPlate"], "protected_bodies": ["ProtectedPlate"]}}
+  ]
+}

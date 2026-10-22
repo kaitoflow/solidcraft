@@ -5,6 +5,26 @@ fn cube(half: f64) -> Body {
     box_solid(Vec3::new(-half, -half, -half), Vec3::new(half, half, half)).unwrap()
 }
 
+#[test]
+fn topology_closure_distinguishes_closed_open_empty_and_mesh_bodies() {
+    let mut body = cube(1.0);
+    assert_eq!(body.topology_closure().unwrap(), Some(true));
+    let closed = body.solid.boundaries().first().unwrap().clone();
+    let mut mixed = body.clone();
+    mixed.solid = std::sync::Arc::new(Solid::new_unchecked(vec![closed, mt::Shell::default()]));
+    assert_eq!(mixed.topology_closure().unwrap(), Some(false));
+    let shell = body.solid.boundaries().first().unwrap();
+    let open = mt::Shell::from(shell.iter().skip(1).cloned().collect::<Vec<_>>());
+    body.solid = std::sync::Arc::new(Solid::new_unchecked(vec![open]));
+    assert_eq!(body.topology_closure().unwrap(), Some(false));
+    body.solid = std::sync::Arc::new(Solid::new_unchecked(vec![mt::Shell::default()]));
+    assert_eq!(body.topology_closure().unwrap(), Some(false));
+    body.solid = std::sync::Arc::new(Solid::new_unchecked(Vec::new()));
+    assert_eq!(body.topology_closure().unwrap(), None);
+    let mesh = crate::mesh_body(&[Vec3::ZERO, Vec3::X, Vec3::Y], &[[0, 1, 2]]).unwrap();
+    assert_eq!(mesh.topology_closure().unwrap(), None);
+}
+
 fn nested_island() -> Body {
     let hollow = boolean(&cube(50.0), &cube(40.0), BoolOp::Cut).unwrap().unwrap();
     // This order puts the containing outer shell ahead of the disconnected island.
