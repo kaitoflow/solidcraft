@@ -2,6 +2,143 @@ use serde_json::{Value, json};
 
 use crate::Session;
 
+#[path = "../../examples/support/thermal_tiled_plate.rs"]
+mod tiled_fixture;
+
+fn merge_source(s: &mut Session) -> (String, String) {
+    let body = tiled_fixture::tiled_plate().unwrap();
+    assert_eq!(body.face_count(), 32);
+    let text = tiled_fixture::step_with_boundaries(&body, "analytic-coplanar-source").unwrap();
+    let owner = s.active_component;
+    let id = s
+        .doc_mut()
+        .add_feature(
+            solidcraft_doc::FeatureKind::Import { file: "analytic.step".into(), step: text.into(), components: vec![], skip: vec![] },
+            Some("Plate"),
+        )
+        .unwrap();
+    let f = s.doc_mut().feature_mut(id).unwrap();
+    f.component = owner;
+    f.body_names = vec!["Plate".into()];
+    s.refresh();
+    let world = s.world_state();
+    let b = &world.bodies[0];
+    (b.name.clone(), format!("{:016x}", b.geometry_key().unwrap()))
+}
+
+#[test]
+fn merge_preview_retains_interfaces_in_an_independent_native_candidate() {
+    let mut s = Session::default();
+    let (name, key) = merge_source(&mut s);
+    let protected: Vec<_> =
+        s.world_state().bodies[0].body.faces(0.01).unwrap().iter().filter(|f| f.plane_normal.is_some_and(|n| n.z > 0.9)).map(|f| f.index).collect();
+    assert_eq!(protected.len(), 8);
+    let before = s.doc.to_json();
+    let result = run(
+        &mut s,
+        "thermal.merge_coplanar_preview",
+        json!({"body":name,"geometry_key":key,"protection":"explicit_faces","protected_faces":protected,"include_native":true}),
+    );
+    assert_eq!(result["status"], "merged");
+    assert_eq!(result["source_faces"], 32);
+    assert_eq!(result["candidate_faces"], 17);
+    assert_eq!(result["protected_face_mapping"].as_array().unwrap().len(), 8);
+    assert_eq!(s.doc.to_json(), before);
+    assert_eq!(result["design_modified"], false);
+    assert_eq!(result["lineage_scope"], "immediate_input_snapshot_face_indices");
+    assert_eq!(result["candidate_encoding"], "solidcraft-native-brep-experimental-same-producer");
+    assert_eq!(result["step_interchange_check"], "not_run");
+    let hex = result["candidate_native_hex"].as_str().unwrap();
+    let bytes: Vec<_> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+    let candidate = solidcraft_kernel::decode_native_body(&bytes).unwrap();
+    assert_eq!(candidate.face_count(), 17);
+    assert!(candidate.validity().is_empty());
+    assert!(!candidate.contains(solidcraft_geom::Vec3::new(1.5, 1.5, 0.5)));
+    let original = s.world_state().bodies[0].body.faces(0.01).unwrap();
+    let after = candidate.faces(0.01).unwrap();
+    for mapping in result["protected_face_mapping"].as_array().unwrap() {
+        let (a, b) = (mapping[0].as_u64().unwrap() as usize, mapping[1].as_u64().unwrap() as usize);
+        assert!(original[a].centroid.dist(after[b].centroid) < 1e-9);
+        assert!((original[a].area - after[b].area).abs() < 1e-9);
+    }
+    run(&mut s, "solid.box", json!({"corner":[10,0,0],"length":1,"width":1,"height":1,"body_name":"UndoWitness"}));
+    let world = s.world_state();
+    let current = world.bodies.iter().find(|b| b.name == name).unwrap();
+    let key = format!("{:016x}", current.geometry_key().unwrap());
+    run(&mut s, "thermal.merge_coplanar_preview", json!({"body":name,"geometry_key":key,"protection":"unconfirmed","protected_faces":[]}));
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(s.world_state().bodies.len(), 1);
+}
+
+#[test]
+fn merge_preview_blocks_unknown_roles_and_rejects_stale_or_bad_selections() {
+    let mut s = Session::default();
+    let (name, key) = merge_source(&mut s);
+    let before = s.doc.to_json();
+    for protection in ["unconfirmed", "whole_body"] {
+        let result = run(
+            &mut s,
+            "thermal.merge_coplanar_preview",
+            json!({"body":name,"geometry_key":key,"protection":protection,"protected_faces":[],"include_native":true}),
+        );
+        assert_eq!(result["status"], "blocked");
+        assert!(result["candidate_faces"].is_null());
+        assert!(result["candidate_native_hex"].is_null());
+    }
+    for value in [
+        json!({"body":name,"geometry_key":"0000000000000000","protection":"explicit_faces","protected_faces":[0]}),
+        json!({"body":name,"geometry_key":key,"protection":"explicit_faces","protected_faces":[]}),
+        json!({"body":name,"geometry_key":key,"protection":"explicit_faces","protected_faces":[0,0]}),
+        json!({"body":name,"geometry_key":key,"protection":"explicit_faces","protected_faces":[9999]}),
+        json!({"body":"missing","geometry_key":key,"protection":"explicit_faces","protected_faces":[0]}),
+        json!({"body":name,"geometry_key":key,"protection":"explicit_faces","protected_faces":[0],"apply":true}),
+    ] {
+        assert!(s.execute("thermal.merge_coplanar_preview", &value).is_err(), "{value}");
+        assert_eq!(s.doc.to_json(), before);
+    }
+    let all: Vec<_> = (0..32).collect();
+    let kept =
+        run(&mut s, "thermal.merge_coplanar_preview", json!({"body":name,"geometry_key":key,"protection":"explicit_faces","protected_faces":all}));
+    assert_eq!(kept["status"], "unchanged");
+    assert_eq!(kept["candidate_faces"], 32);
+    assert!(kept["candidate_native_hex"].is_null());
+    let reduced = run(
+        &mut s,
+        "thermal.merge_coplanar_preview",
+        json!({"body":name,"geometry_key":key,"protection":"explicit_faces","protected_faces":[],"allow_empty_protection":true}),
+    );
+    assert_eq!(reduced["candidate_faces"], 10);
+    assert_eq!(s.doc.to_json(), before);
+}
+
+#[test]
+fn merge_preview_uses_current_world_placement_and_mm_after_occurrence_move() {
+    let mut s = Session::default();
+    let component = run(&mut s, "component.create", json!({"name":"PlacedPlate"}))["component"].as_u64().unwrap();
+    let (name, old_key) = merge_source(&mut s);
+    let occurrence = s.doc.occurrences.iter().find(|o| o.component == component).unwrap().id;
+    run(&mut s, "occurrence.move", json!({"occurrence":occurrence,"translate":[20,30,0],"axis":[0,0,1],"angle":"90 deg"}));
+    assert!(
+        s.execute("thermal.merge_coplanar_preview", &json!({"body":name,"geometry_key":old_key,"protection":"explicit_faces","protected_faces":[0]}))
+            .is_err()
+    );
+    run(&mut s, "document.units", json!({"units":"cm"}));
+    let world = s.world_state();
+    let b = world.bodies.iter().find(|b| b.name == name).unwrap();
+    let key = format!("{:016x}", b.geometry_key().unwrap());
+    let params = json!({"body":name,"geometry_key":key,"protection":"explicit_faces","protected_faces":[],"allow_empty_protection":true,"include_native":true});
+    let before = s.doc.to_json();
+    let result = run(&mut s, "thermal.merge_coplanar_preview", params);
+    let hex = result["candidate_native_hex"].as_str().unwrap();
+    let bytes: Vec<_> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+    let candidate = solidcraft_kernel::decode_native_body(&bytes).unwrap();
+    let measured = solidcraft_kernel::measure(&candidate).unwrap();
+    assert!(measured.bbox.min.dist(solidcraft_geom::Vec3::new(17., 30., 0.)) < 1e-9);
+    assert!(measured.bbox.max.dist(solidcraft_geom::Vec3::new(20., 33., 1.)) < 1e-9);
+    assert!((measured.volume - 8.).abs() < 1e-9);
+    assert_eq!(s.doc.to_json(), before);
+}
+
 fn run(s: &mut Session, command: &str, params: Value) -> Value {
     s.execute(command, &params).unwrap_or_else(|e| panic!("{command}: {e}"))
 }

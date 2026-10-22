@@ -32,8 +32,8 @@ Body names identify placements in the currently loaded design, not durable engin
 `definition_body` and `definition_to_world` preserve the definition/instance distinction.
 `geometry_key` is session identity, not a file digest or a persistent object identifier.
 Hidden placements remain eligible when explicitly named; the command does not change or
-infer visibility. Protection currently covers whole placements; interface/face-level
-protection remains outside the first implementation.
+infer visibility. The envelope plan protects whole placements. The separate coplanar preview
+below adds explicit snapshot face protection.
 
 ## Run
 
@@ -156,6 +156,70 @@ The two placement regressions and the ten thermal command tests also passed afte
 change. A CLI GPU snapshot of a generic two-box STEP reproduction was inspected; `eval`
 placed the second box at the analytically expected +100 mm translation. These tests use
 generic analytic geometry; private comparison evidence is not a fixture.
+
+## Protected coplanar candidates
+
+`thermal.merge_coplanar_preview` computes a separate candidate on one explicit world body.
+It requires the current 16-digit `geometry_key`, an explicit protection mode, and current
+`protected_faces` indices. `unconfirmed` and `whole_body` return a blocked result without
+candidate geometry. `explicit_faces` permits only the specified geometric experiment; an
+empty list also requires `allow_empty_protection: true`. The caller must retain an object
+whose engineering role is unknown instead of using that opt-in to infer permission.
+
+The guarded kernel method `Body::merge_coplanar_preview` joins edge-adjacent polygon faces
+on the same oriented planar support. It reuses the strict topological loop builder rather
+than general healing. Plane agreement uses its existing 4096-times-machine-epsilon support
+checks; it is not a thermal equivalence certificate. Curved faces and boundaries are not
+refitted. Every surviving edge and each protected face stay the original topology objects.
+Protected faces cannot join a multi-face group, and all their edge identities are excluded
+from removal. Authored split edges cannot be bypassed through another adjacency path.
+
+The first slice admits one B-rep shell with up to 1024 faces and 16384 edge uses. It caps
+authored boundary work, checks solid validity and crossed trims, and rejects candidate
+volume differences over 1e-6 relative to the input. Whole-body authored-boundary protection
+and per-face paint are retained by refusing the operation. Source/undo/visibility remain
+unchanged. An attempted group that cannot reconstruct its closed outer and hole boundaries
+returns an error; no eligible group returns `unchanged`. Only an actual face reduction
+returns `merged`.
+The host still supplies process time and memory budgets for imported geometry; these
+topology limits do not replace an operating-system execution budget.
+
+`output_face_sources` maps each output to the immediate input's face indices. It does not
+compose ancestor history or create persistent engineering identities. The session geometry
+key binds these indices to the current world placement. Optional `include_native: true`
+returns at most 8 MiB of native B-rep bytes as hex, identified as an experimental archive
+for the same producer. No transport path, document adoption or STEP acceptance is implied;
+`step_interchange_check` remains `not_run` at this command boundary.
+
+```text
+cargo test --profile ci -p solidcraft-kernel --lib body::planar_regularize::tests
+cargo test --profile ci -p solidcraft-engine --lib thermal::tests
+cargo run --profile ci -p solidcraft-engine --example thermal_merge_lab -- target/thermal-merge-demo
+```
+
+The fixed analytic example constructs a tiled plate with a square through opening and
+defines its eight top tiles as protected. Its expected reductions are 32 to 17 faces with
+protection, and 32 to 10 without protection. It writes a separate native candidate, STEP
+and design, independently opens the STEP in a new session, and requires eight unique
+protected face/trim matches, unchanged input, a retained opening and volume checks.
+The STEP writer itself can merge planar subdivisions, so the analytic runner supplies
+all surviving boundaries to an export copy before writing and checks the actual reopened
+file. The source geometry and its document are not modified. This is a local analytic
+demonstration; private same-part commercial CAD comparison remains a separate experiment.
+
+The local run passed the six focused planar topology tests and thirteen thermal command
+tests. The fixed example retained all eight protected regions after actual STEP export
+and independent reopen, with zero observed boundary-distance and volume differences on
+this analytic fixture. Before/after CLI CPU snapshots were generated and inspected.
+The default GPU snapshot path exited with Windows access violation `0xC0000005` for both
+this fixture and the separate two-box control; the renderer cause remains unresolved.
+No GPU code was changed or GPU stability pass recorded. The documented per-process
+`SOLIDCRAFT_GPU=cpu` policy produced the reviewed snapshots.
+
+Full CI was attempted again and stopped at the unchanged upstream geometry Clippy check.
+A kernel-only Clippy check also reported six existing `nonminimal_bool` errors in unchanged
+`coplanar.rs`, `curveblend.rs`, `ops.rs`, `step_in/brep.rs`, `tess/grid.rs` and `tess/seam.rs`.
+No unrelated fixes or lint suppressions were added.
 
 ## Controlled local repair
 

@@ -1,4 +1,4 @@
-//! Read-only, explicit-selection envelope planning for the independent thermal lab.
+//! Read-only envelope plans and protected coplanar candidates for the independent thermal lab.
 //! No source body is removed, no feature is added, and no engineering parameter is inferred.
 
 use std::collections::BTreeSet;
@@ -9,12 +9,15 @@ use solidcraft_geom::Vec3;
 use super::CommandSpec;
 use crate::params::bad;
 use crate::schema::thermal::{Bounds, BoxProposal, EnvelopeEntry, EnvelopeParams, EnvelopePlan, EnvelopeSource};
+use crate::schema::thermal::{InterfaceProtection, MergePreview, MergePreviewParams};
 use crate::{Result, Session};
 
 const ID: &str = "thermal.envelope_plan";
 const MAX_BODIES: usize = 128;
 const MAX_PADDING_MM: f64 = 1_000_000.0;
 const CONTRACT: crate::schema::TypedContract<EnvelopeParams> = crate::schema::TypedContract::new();
+const MERGE_ID: &str = "thermal.merge_coplanar_preview";
+const MERGE_CONTRACT: crate::schema::TypedContract<MergePreviewParams> = crate::schema::TypedContract::new();
 
 pub static COMMANDS: &[CommandSpec] = &[CommandSpec::new(ID, "Plan Thermal Envelopes", envelope_plan)
     .icon("inspect")
@@ -25,7 +28,14 @@ pub static COMMANDS: &[CommandSpec] = &[CommandSpec::new(ID, "Plan Thermal Envel
         "bodies: [1..128 exact world body names]; protected_bodies?: [names]; padding_mm?: finite number 0..1000000 (default 0). \
          Read-only world-mm axis-aligned box proposals, source definition/placement, raw topology and checked candidate volume; \
          protected, mesh or invalid bodies are blocked. No inferred thermal role, material, loss, acceptance or geometry change.",
-    )];
+    ),
+    CommandSpec::new(MERGE_ID, "Preview Protected Coplanar Merge", merge_preview)
+        .icon("inspect")
+        .noundo()
+        .contract(&MERGE_CONTRACT)
+        .output(crate::schema::output_schema_for::<MergePreview>)
+        .params("body: exact world placement; geometry_key: current session key; protection: unconfirmed|whole_body|explicit_faces; protected_faces: distinct current indices; allow_empty_protection?: false; include_native?: false. Read-only polygonal coplanar candidate; source and undo unchanged, unknown interfaces protected as a whole."),
+];
 
 fn xyz(v: Vec3) -> [f64; 3] {
     [v.x, v.y, v.z]
@@ -163,6 +173,87 @@ fn envelope_plan(s: &mut Session, raw: &Value) -> Result<Value> {
         entries,
     })
     .map_err(|e| bad(ID, format!("could not serialize the envelope plan: {e}")))
+}
+
+fn merge_preview(s: &mut Session, raw: &Value) -> Result<Value> {
+    let params: MergePreviewParams = serde_json::from_value(raw.clone()).map_err(|e| bad(MERGE_ID, e.to_string()))?;
+    if params.body.trim().is_empty()
+        || params.body.len() > 1024
+        || params.geometry_key.len() != 16
+        || !params.geometry_key.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(bad(MERGE_ID, "an exact body and current 16-digit geometry key are required"));
+    }
+    let world = s.world_state();
+    let matches: Vec<_> = world.bodies.iter().filter(|b| b.name == params.body).collect();
+    let [body] = matches.as_slice() else { return Err(bad(MERGE_ID, "body must identify exactly one world placement")) };
+    let key = body.geometry_key().map(|k| format!("{k:016x}")).ok_or_else(|| bad(MERGE_ID, "placement geometry identity is unavailable"))?;
+    if key != params.geometry_key {
+        return Err(bad(MERGE_ID, "stale geometry key; resolve protection on the current world placement"));
+    }
+    if params.protected_faces.len() > 1024
+        || params.protected_faces.iter().any(|i| *i >= body.body.face_count())
+        || params.protected_faces.iter().copied().collect::<BTreeSet<_>>().len() != params.protected_faces.len()
+    {
+        return Err(bad(MERGE_ID, "protected faces must be distinct current indices, at most 1024"));
+    }
+    let mut result = MergePreview {
+        format: "solidcraft.protected-coplanar-preview/1".into(),
+        operation: MERGE_ID.into(),
+        status: "blocked".into(),
+        blocked_reasons: Vec::new(),
+        world_body: params.body,
+        source_geometry_key: key,
+        frame: "world".into(),
+        length_unit: "mm".into(),
+        design_modified: false,
+        thermal_equivalence: "not_evaluated".into(),
+        protection_scope: "caller_selected_snapshot_geometry_not_engineering_role_confirmation".into(),
+        source_faces: body.body.face_count(),
+        candidate_faces: None,
+        source_volume_mm3: None,
+        candidate_volume_mm3: None,
+        relative_volume_delta: None,
+        output_face_sources: Vec::new(),
+        lineage_scope: "immediate_input_snapshot_face_indices".into(),
+        protected_face_mapping: Vec::new(),
+        protected_edges_preserved: 0,
+        candidate_native_hex: None,
+        candidate_encoding: None,
+        step_interchange_check: "not_run".into(),
+    };
+    match params.protection {
+        InterfaceProtection::Unconfirmed => result.blocked_reasons.push("unconfirmed_interfaces_protect_whole_body".into()),
+        InterfaceProtection::WholeBody => result.blocked_reasons.push("protected_whole_body".into()),
+        InterfaceProtection::ExplicitFaces => {
+            if params.protected_faces.is_empty() && !params.allow_empty_protection {
+                return Err(bad(MERGE_ID, "empty protection requires explicit allow_empty_protection"));
+            }
+            let preview = body.body.merge_coplanar_preview(&params.protected_faces).map_err(|e| bad(MERGE_ID, e.to_string()))?;
+            result.status = if preview.changed { "merged" } else { "unchanged" }.into();
+            result.candidate_faces = Some(preview.body.face_count());
+            result.source_volume_mm3 = Some(preview.source_volume_mm3);
+            result.candidate_volume_mm3 = Some(preview.candidate_volume_mm3);
+            result.relative_volume_delta = Some(preview.relative_volume_delta);
+            result.output_face_sources = preview.output_face_sources;
+            result.protected_face_mapping = preview.protected_faces.into_iter().map(|(a, b)| [a, b]).collect();
+            result.protected_edges_preserved = preview.protected_edges;
+            if params.include_native {
+                use std::fmt::Write;
+                let bytes = solidcraft_kernel::encode_native_body(&preview.body).map_err(|e| bad(MERGE_ID, e.to_string()))?;
+                if bytes.len() > 8 * 1024 * 1024 {
+                    return Err(bad(MERGE_ID, "candidate native geometry exceeds 8 MiB"));
+                }
+                let mut hex = String::with_capacity(bytes.len() * 2);
+                for byte in bytes {
+                    write!(hex, "{byte:02x}").map_err(|e| bad(MERGE_ID, e.to_string()))?;
+                }
+                result.candidate_native_hex = Some(hex);
+                result.candidate_encoding = Some("solidcraft-native-brep-experimental-same-producer".into());
+            }
+        }
+    }
+    serde_json::to_value(result).map_err(|e| bad(MERGE_ID, e.to_string()))
 }
 
 #[cfg(test)]

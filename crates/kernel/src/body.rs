@@ -7,6 +7,7 @@ use crate::{KernelError, Result, guard};
 
 #[path = "planar_regularize.rs"]
 mod planar_regularize;
+pub use planar_regularize::CoplanarMergePreview;
 #[path = "planar_sources.rs"]
 mod planar_sources;
 #[path = "shell_groups.rs"]

@@ -321,9 +321,332 @@ impl Body {
     }
 }
 
+/// An independent candidate, with each output face mapped to the immediate input's indices.
+/// Lineage is snapshot-local, not a composition over the input's earlier history or engineering roles.
+#[derive(Clone, Debug)]
+pub struct CoplanarMergePreview {
+    pub body: Body,
+    pub changed: bool,
+    pub output_face_sources: Vec<Vec<usize>>,
+    /// (input face, output face), retained as the original face and boundary objects.
+    pub protected_faces: Vec<(usize, usize)>,
+    pub protected_edges: usize,
+    pub source_volume_mm3: f64,
+    pub candidate_volume_mm3: f64,
+    pub relative_volume_delta: f64,
+}
+
+impl Body {
+    /// Merge only adjacent planar polygon faces on the same oriented support, in a new body.
+    /// Protected faces and every surviving edge remain the very input topology objects.
+    /// Existing authored split lines also veto internal-edge removal, including bypass paths.
+    /// An attempted group that cannot be rebuilt is an error, distinct from no eligible group.
+    pub fn merge_coplanar_preview(&self, protected_faces: &[usize]) -> Result<CoplanarMergePreview> {
+        let invalid = |reason: &str| crate::KernelError::Invalid(format!("coplanar preview: {reason}"));
+        if self.is_mesh() || self.shell_count() != 1 || self.face_count() > 1024 || self.face_count() == 0 || protected_faces.len() > 1024 {
+            return Err(invalid("requires one B-rep shell with 1..1024 faces"));
+        }
+        if self.regularization_protected || self.paint().is_some_and(|p| !p.faces.is_empty()) {
+            return Err(invalid("authored whole-body boundaries or per-face paint require preservation"));
+        }
+        let protected: HashSet<_> = protected_faces.iter().copied().collect();
+        if protected.len() != protected_faces.len() || protected.iter().any(|i| *i >= self.face_count()) {
+            return Err(invalid("protected faces must be distinct current face indices"));
+        }
+        guard("protected coplanar preview", || {
+            let uses = self
+                .solid
+                .face_iter()
+                .try_fold(0usize, |sum, f| f.absolute_boundaries().iter().try_fold(sum, |n, w| n.checked_add(w.len()).filter(|n| *n <= 16_384)))
+                .ok_or_else(|| invalid("topology budget exceeded"))?;
+            let split_points = self
+                .split_keep()
+                .iter()
+                .try_fold(0usize, |n, line| n.checked_add(line.len()).filter(|n| *n <= 4096))
+                .ok_or_else(|| invalid("authored-boundary budget exceeded"))?;
+            if uses.saturating_mul(split_points.saturating_add(1)) > 2_000_000 {
+                return Err(invalid("authored-boundary work budget exceeded"));
+            }
+            if self.split_keep().iter().any(|line| line.len() < 2 || line.iter().any(|p| !p.is_finite())) {
+                return Err(invalid("authored boundaries must contain finite polylines"));
+            }
+            if !self.validity().is_empty() || self.crossed_face_loops()? != 0 {
+                return Err(invalid("input solid checks failed"));
+            }
+            let measured = crate::measure(self)?;
+            if !measured.volume.is_finite() || measured.volume <= 0.0 {
+                return Err(invalid("input volume must be finite and positive"));
+            }
+            let faces: Vec<_> = self.solid.face_iter().collect();
+            let protected_edge_ids: HashSet<_> = protected.iter().filter_map(|i| faces.get(*i)).flat_map(|f| f.edge_iter().map(|e| e.id())).collect();
+            let planes: Vec<_> = faces.iter().map(|f| super::planar_sources::actual_plane(f)).collect();
+            let mut adjacency = HashMap::<mt::EdgeID, Vec<(usize, mt::Edge)>>::new();
+            for (i, face) in faces.iter().enumerate() {
+                for edge in face.boundary_iters().into_iter().flatten() {
+                    adjacency.entry(edge.id()).or_default().push((i, edge));
+                }
+            }
+            let polygon: Vec<_> = faces.iter().map(|f| f.edge_iter().all(|e| matches!(e.curve(), mt::Curve::Line(_)))).collect();
+            let mut parent: Vec<_> = (0..faces.len()).collect();
+            let mut eligible = HashSet::new();
+            for es in adjacency.values() {
+                let [(a, ea), (b, eb)] = es.as_slice() else { continue };
+                if a == b
+                    || protected.contains(a)
+                    || protected.contains(b)
+                    || protected_edge_ids.contains(&ea.id())
+                    || ea.orientation() == eb.orientation()
+                {
+                    continue;
+                }
+                let (Some(Some(pa)), Some(Some(pb))) = (planes.get(*a), planes.get(*b)) else { continue };
+                if !polygon.get(*a).copied().unwrap_or(false)
+                    || !polygon.get(*b).copied().unwrap_or(false)
+                    || !super::planar_sources::same_support(pa, pb)
+                    || crate::heal::on_split_line(&crate::heal::edge_points(ea), self.split_keep())
+                {
+                    continue;
+                }
+                eligible.insert(ea.id());
+                let (ra, rb) = (crate::heal::find(&mut parent, *a), crate::heal::find(&mut parent, *b));
+                if let Some(p) = parent.get_mut(ra.max(rb)) {
+                    *p = ra.min(rb);
+                }
+            }
+            let mut groups = BTreeMap::<usize, Vec<usize>>::new();
+            for i in 0..faces.len() {
+                groups.entry(crate::heal::find(&mut parent, i)).or_default().push(i);
+            }
+            let mut output = Vec::new();
+            let mut lineage = Vec::new();
+            let mut source_metadata = Vec::new();
+            for members in groups.values() {
+                let first = *members.first().ok_or_else(|| invalid("empty face group"))?;
+                let face = if members.len() == 1 {
+                    (**faces.get(first).ok_or_else(|| invalid("missing input face"))?).clone()
+                } else {
+                    let plane = planes.get(first).copied().flatten().ok_or_else(|| invalid("group has no plane"))?;
+                    if members.iter().any(|i| planes.get(*i).and_then(Option::as_ref).is_none_or(|p| !super::planar_sources::same_support(&plane, p)))
+                    {
+                        return Err(invalid("group exceeds common support accuracy"));
+                    }
+                    merged_face(&faces, members, plane, &eligible)
+                        .ok_or_else(|| invalid("attempted merge cannot retain closed outer, hole and authored boundaries"))?
+                };
+                output.push(face);
+                lineage.push(members.clone());
+                // A merged face has explicit operation lineage, never an invented source certificate.
+                source_metadata.push(if members.len() == 1 { self.face_sources().and_then(|s| s.get(first)).cloned().flatten() } else { None });
+            }
+            let changed = output.len() < faces.len();
+            let mut candidate = if changed {
+                let solid = mt::Solid::try_new(vec![mt::Shell::from(output)])
+                    .map_err(|e| crate::KernelError::Failed(format!("coplanar preview does not close: {e}")))?;
+                let body = Body::new_placed(solid, false, None, true)?
+                    .with_color(self.color())
+                    .with_paint(self.paint().cloned())
+                    .with_split_lines(self.split_lines().cloned())
+                    .with_boundary_tol(self.boundary_tol)
+                    .with_face_sources(Some(Arc::new(source_metadata)));
+                let prov = lineage.iter().map(|m| (m.iter().map(|&face| FaceOrigin::Face { operand: 0, face }).collect(), m.len() == 1)).collect();
+                crate::record::traced(
+                    body,
+                    &crate::record::counts(&[self]),
+                    Some(crate::record::regions(prov)),
+                    Some(&crate::record::edge_origins(&self.solid, 0)),
+                )
+            } else {
+                self.clone()
+            };
+            if changed && candidate.history().is_none() {
+                return Err(invalid("complete operation lineage could not be recorded"));
+            }
+            let candidate_faces: Vec<_> = candidate.solid.face_iter().collect();
+            let mut kept = Vec::new();
+            let mut protected_edges = HashSet::new();
+            for input in protected_faces {
+                let matches: Vec<_> = lineage.iter().enumerate().filter(|(_, m)| m.as_slice() == [*input]).map(|(i, _)| i).collect();
+                let [out] = matches.as_slice() else { return Err(invalid("protected face lineage changed")) };
+                let before = faces.get(*input).ok_or_else(|| invalid("missing protected input"))?;
+                let after = candidate_faces.get(*out).ok_or_else(|| invalid("missing protected output"))?;
+                if before.id() != after.id()
+                    || before.orientation() != after.orientation()
+                    || !before.boundary_iters().into_iter().flatten().map(|e| (e.id(), e.orientation())).eq(after
+                        .boundary_iters()
+                        .into_iter()
+                        .flatten()
+                        .map(|e| (e.id(), e.orientation())))
+                {
+                    return Err(invalid("protected face or boundary objects changed"));
+                }
+                protected_edges.extend(before.edge_iter().map(|e| e.id()));
+                kept.push((*input, *out));
+            }
+            if !candidate.validity().is_empty() || candidate.crossed_face_loops()? != 0 {
+                return Err(invalid("candidate solid checks failed"));
+            }
+            let after = crate::measure(&candidate)?;
+            let relative_volume_delta = (after.volume - measured.volume).abs() / measured.volume;
+            if !relative_volume_delta.is_finite() || relative_volume_delta > 1e-6 {
+                return Err(invalid("candidate volume difference exceeds 1e-6"));
+            }
+            if changed && !protected_faces.is_empty() {
+                candidate.regularization_protected = true;
+            }
+            Ok(CoplanarMergePreview {
+                body: candidate,
+                changed,
+                output_face_sources: lineage,
+                protected_faces: kept,
+                protected_edges: protected_edges.len(),
+                source_volume_mm3: measured.volume,
+                candidate_volume_mm3: after.volume,
+                relative_volume_delta,
+            })
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Analytic unit-height 3x3 grid, optionally with a square through opening.
+    fn tiled_plate(hole: bool) -> Body {
+        type Point = (i32, i32, i32);
+        let cells: HashSet<_> = (0..3).flat_map(|x| (0..3).map(move |y| (x, y))).filter(|p| !hole || *p != (1, 1)).collect();
+        let mut vertices = BTreeMap::<Point, mt::Vertex>::new();
+        let mut edges = BTreeMap::<(Point, Point), mt::Edge>::new();
+        let mut faces = Vec::new();
+        for x in 0..3 {
+            for y in 0..3 {
+                if !cells.contains(&(x, y)) {
+                    continue;
+                }
+                let quads = [
+                    (true, [(x, y, 0), (x, y + 1, 0), (x + 1, y + 1, 0), (x + 1, y, 0)]),
+                    (true, [(x, y, 1), (x + 1, y, 1), (x + 1, y + 1, 1), (x, y + 1, 1)]),
+                    (!cells.contains(&(x - 1, y)), [(x, y, 0), (x, y, 1), (x, y + 1, 1), (x, y + 1, 0)]),
+                    (!cells.contains(&(x + 1, y)), [(x + 1, y, 0), (x + 1, y + 1, 0), (x + 1, y + 1, 1), (x + 1, y, 1)]),
+                    (!cells.contains(&(x, y - 1)), [(x, y, 0), (x + 1, y, 0), (x + 1, y, 1), (x, y, 1)]),
+                    (!cells.contains(&(x, y + 1)), [(x, y + 1, 0), (x, y + 1, 1), (x + 1, y + 1, 1), (x + 1, y + 1, 0)]),
+                ];
+                for (_, quad) in quads.into_iter().filter(|(exposed, _)| *exposed) {
+                    let wire: mt::Wire = (0..4)
+                        .map(|i| {
+                            let (a, b) = (quad[i], quad[(i + 1) % 4]);
+                            let pair = (a.min(b), a.max(b));
+                            let va = vertices
+                                .entry(pair.0)
+                                .or_insert_with(|| mt::builder::vertex(mt::Point3::new(pair.0.0 as f64, pair.0.1 as f64, pair.0.2 as f64)))
+                                .clone();
+                            let vb = vertices
+                                .entry(pair.1)
+                                .or_insert_with(|| mt::builder::vertex(mt::Point3::new(pair.1.0 as f64, pair.1.1 as f64, pair.1.2 as f64)))
+                                .clone();
+                            let edge = edges.entry(pair).or_insert_with(|| mt::builder::line(&va, &vb));
+                            if a == pair.0 { edge.clone() } else { edge.inverse() }
+                        })
+                        .collect();
+                    faces.push(mt::builder::try_attach_plane(&[wire]).unwrap());
+                }
+            }
+        }
+        Body::new(mt::Solid::try_new(vec![mt::Shell::from(faces)]).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn coplanar_preview_reduces_tiled_faces_and_retains_square_opening() {
+        let input = tiled_plate(true);
+        assert_eq!(input.face_count(), 32);
+        let before = crate::encode_native_body(&input).unwrap();
+        let preview = input.merge_coplanar_preview(&[]).unwrap();
+        assert!(preview.changed);
+        assert_eq!(preview.body.face_count(), 10);
+        assert!((preview.source_volume_mm3 - 8.).abs() < 1e-10);
+        assert!(preview.relative_volume_delta < 1e-12);
+        assert!(!preview.body.contains(solidcraft_geom::Vec3::new(1.5, 1.5, 0.5)), "through opening must remain empty");
+        assert!(preview.body.contains(solidcraft_geom::Vec3::new(0.5, 0.5, 0.5)));
+        let mut source: Vec<_> = preview.output_face_sources.iter().flatten().copied().collect();
+        source.sort_unstable();
+        assert_eq!(source, (0..32).collect::<Vec<_>>());
+        let holes = preview.body.solid.face_iter().filter(|f| f.absolute_boundaries().len() == 2).count();
+        assert_eq!(holes, 2, "top and bottom retain the through opening's inner loop");
+        let native = crate::encode_native_body(&preview.body).unwrap();
+        let reopened = crate::decode_native_body(&native).unwrap();
+        assert_eq!(reopened.face_count(), 10);
+        assert_eq!(crate::encode_native_body(&reopened).unwrap(), native);
+        assert_eq!(crate::encode_native_body(&input).unwrap(), before, "source is unchanged");
+    }
+
+    #[test]
+    fn coplanar_preview_keeps_protected_tiles_and_all_their_edges() {
+        let input = tiled_plate(true);
+        let protected: Vec<_> = input
+            .solid
+            .face_iter()
+            .enumerate()
+            .filter_map(|(i, f)| super::super::planar_sources::actual_plane(f).filter(|p| p.normal().z > 0.9).map(|_| i))
+            .collect();
+        assert_eq!(protected.len(), 8);
+        let preview = input.merge_coplanar_preview(&protected).unwrap();
+        assert_eq!(preview.body.face_count(), 17);
+        assert_eq!(preview.protected_faces.len(), 8);
+        assert!(preview.protected_edges >= 16);
+        for (a, b) in preview.protected_faces {
+            let original = input.solid.face_iter().nth(a).unwrap();
+            let after = preview.body.solid.face_iter().nth(b).unwrap();
+            assert_eq!(original.id(), after.id());
+            assert_eq!(
+                original.boundary_iters().into_iter().flatten().map(|e| (e.id(), e.orientation())).collect::<Vec<_>>(),
+                after.boundary_iters().into_iter().flatten().map(|e| (e.id(), e.orientation())).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn coplanar_preview_noop_and_invalid_protection_are_distinct() {
+        let input = tiled_plate(false);
+        let all: Vec<_> = (0..input.face_count()).collect();
+        let preview = input.merge_coplanar_preview(&all).unwrap();
+        assert!(!preview.changed);
+        assert!(preview.body.same(&input));
+        assert_eq!(preview.output_face_sources, all.iter().map(|i| vec![*i]).collect::<Vec<_>>());
+        assert!(input.merge_coplanar_preview(&[0, 0]).is_err());
+        assert!(input.merge_coplanar_preview(&[input.face_count()]).is_err());
+        let plain = crate::box_solid(solidcraft_geom::Vec3::ZERO, solidcraft_geom::Vec3::new(1., 2., 3.)).unwrap();
+        assert!(!plain.merge_coplanar_preview(&[]).unwrap().changed);
+        let curved = crate::cylinder(solidcraft_geom::Vec3::ZERO, solidcraft_geom::Vec3::Z, 1., 2.).unwrap();
+        assert!(!curved.merge_coplanar_preview(&[]).unwrap().changed, "curved faces are not refitted");
+    }
+
+    #[test]
+    fn coplanar_preview_refuses_mesh_open_and_multiple_shell_inputs() {
+        let mesh = crate::mesh_body(&[solidcraft_geom::Vec3::ZERO, solidcraft_geom::Vec3::X, solidcraft_geom::Vec3::Y], &[[0, 1, 2]]).unwrap();
+        assert!(mesh.merge_coplanar_preview(&[]).is_err());
+        let input = tiled_plate(false);
+        let shell = input.solid.boundaries().first().unwrap().clone();
+        let other = mt::builder::translated(&shell, mt::Vector3::new(10., 0., 0.));
+        let compound = Body::new(mt::Solid::try_new(vec![shell, other]).unwrap()).unwrap();
+        assert!(compound.merge_coplanar_preview(&[]).is_err());
+        let sheet = mt::Shell::from(vec![input.solid.face_iter().next().unwrap().clone()]);
+        let open = Body::new(mt::Solid::new_unchecked(vec![sheet])).unwrap();
+        assert!(open.merge_coplanar_preview(&[]).is_err());
+    }
+
+    #[test]
+    fn coplanar_preview_refuses_bypass_of_an_authored_internal_edge() {
+        let mut input = tiled_plate(false)
+            .with_split_lines(Some(Arc::new(vec![vec![solidcraft_geom::Vec3::new(1., 0., 1.), solidcraft_geom::Vec3::new(1., 1., 1.)]])));
+        assert!(input.merge_coplanar_preview(&[]).is_err(), "the whole-body authored veto is respected");
+        // Exercise per-line structural protection without the stronger whole-body veto.
+        input.regularization_protected = false;
+        let before = crate::encode_native_body(&input).unwrap();
+        let error = input.merge_coplanar_preview(&[]).unwrap_err().to_string();
+        assert!(error.contains("attempted merge"), "{error}");
+        assert_eq!(crate::encode_native_body(&input).unwrap(), before);
+    }
+
     #[test]
     fn alternate_adjacency_path_cannot_remove_protected_internal_edge() {
         let vertices: Vec<_> =
