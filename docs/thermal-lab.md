@@ -80,15 +80,17 @@ successful/refused operations, elapsed time, peak memory, manual interventions, 
 independent reopen. Thermal acceptance additionally needs fixed conditions and solver
 comparison against a selected engineering baseline.
 
-No SpaceClaim comparison has run in this fork. A plan, a smaller face count or a successful
-STEP round trip does not establish better geometry processing or thermal equivalence.
-Commercial CAD baselines and company models belong in a separate private comparison
+Commercial CAD comparisons run in a separate private workspace. A plan, a smaller face
+count or a successful STEP round trip does not establish better geometry processing or
+thermal equivalence. Commercial CAD baselines and company models belong in that private
 workspace and must not enter this public fork, its logs, fixtures, issues or pull requests.
 
 ## Upstream maintenance
 
-The first change stays in the command/schema layer and reuses the existing geometry kernel.
-It does not fork the editor, alter the design format or change kernel algorithms. Upstream
+The envelope command stays in the command/schema layer and reuses the geometry kernel.
+The diagnostics add an independent topology-closure observation; the STEP reader also has
+the narrowly gated placement compatibility described below. This experiment does not fork
+the editor or alter the design format. Upstream
 is evaluating its geometry kernel; broader changes should be pinned and evaluated against
 the same fixtures. Root README, product artwork and generated command inventories stay
 unchanged. Development is on this fork; no upstream issue claim or pull request is required
@@ -116,6 +118,9 @@ tolerances to its scale-dependent minimum. A face's area centroid can lie outsid
 it is not automatically a point for a subsequent edit or a confirmed engineering interface.
 These observations do not repair, simplify or adopt any geometry.
 
+The raw import tree is saved with each node's parent-relative, column-major transform.
+This separates source placement interpretation from application occurrence expansion.
+
 `Body::topology_closure` observes edge incidence independently of STEP shell declarations.
 Empty and mesh bodies return unknown; a nonempty B-rep whose shells are closed and
 consistently oriented returns true. This does not check vertex manifoldness, meshing,
@@ -128,6 +133,29 @@ beyond the trimmed geometry, or miss a face that bulges past its boundary. Compa
 selected surface samples and a common world frame before interpreting box differences
 as displaced or missing parts. Shell count also differs from material-region count when
 a body contains disconnected pieces or cavities.
+
+## STEP placement compatibility
+
+For `ITEM_DEFINED_TRANSFORMATION`, the normal relationship order and standard rigid-frame
+composition remain unchanged. If the two referenced frames appear in the opposite
+representations' direct `Items` lists, and the declared assignment is not also valid, the
+reader reassigns the frame IDs to the relationship endpoints before interpreting their
+length units. It emits a deduplicated `matched by representation membership` warning.
+
+Direct membership is intentional: linked or nested representations do not establish
+exclusive frame ownership. Shared frames that make the declared assignment valid, frames
+listed in both representations, and unlisted frames retain the declared order. There is
+no blanket transform inversion and no writer change.
+
+Analytic regressions exercise a nonzero child reference in centimetres, a millimetre parent,
+a rotated second occurrence, either relationship endpoint as the child, crossed or declared
+frame order, and a shared origin. They check parent-relative tree transforms, world boxes,
+volumes and compatibility warnings. Ambiguous and unlisted frames preserve existing behavior.
+The STEP import test group passed 65 tests, with two pre-existing manual benchmarks ignored.
+The two placement regressions and the ten thermal command tests also passed after the final
+change. A CLI GPU snapshot of a generic two-box STEP reproduction was inspected; `eval`
+placed the second box at the analytically expected +100 mm translation. These tests use
+generic analytic geometry; private comparison evidence is not a fixture.
 
 ## Controlled local repair
 

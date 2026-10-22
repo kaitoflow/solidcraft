@@ -701,6 +701,70 @@ fn hand_written_assembly() {
     assert!((root.children[1].transform[3][0] - 100.0).abs() < 1e-9);
 }
 
+#[test]
+fn item_defined_frames_follow_unambiguous_representation_membership() {
+    for child_is_second in [false, true] {
+        for crossed in [false, true] {
+            for shared_origin in [false, true] {
+                let mut text = two_instance_assembly().replace("#66=CARTESIAN_POINT('',(0.,0.,0.));", "#66=CARTESIAN_POINT('',(1.,2.,0.));");
+                if shared_origin {
+                    text = text.replace("(#81,#84)", "(#81,#84,#65)");
+                }
+                if child_is_second {
+                    text = text.replace("RELATIONSHIP('','',#60,#80)", "RELATIONSHIP('','',#80,#60)");
+                }
+                if child_is_second != crossed {
+                    for (id, target) in [(602, 81), (612, 84)] {
+                        text = text.replace(
+                            &format!("#{id}=ITEM_DEFINED_TRANSFORMATION('','',#65,#{target});"),
+                            &format!("#{id}=ITEM_DEFINED_TRANSFORMATION('','',#{target},#65);"),
+                        );
+                    }
+                }
+                let imported = step_import(&text).unwrap();
+                assert_eq!(imported.bodies.len(), 2);
+                let root = imported.tree.first().unwrap();
+                assert_eq!(root.children.len(), 2);
+                for (child, translation) in root.children.iter().zip([[-10.0, -20.0, 0.0], [120.0, -10.0, 0.0]]) {
+                    for (actual, expected) in child.transform[3].iter().zip(translation) {
+                        assert!((actual - expected).abs() < 1e-9, "{child:?}");
+                    }
+                }
+                let boxes: Vec<_> = imported.bodies.iter().map(|body| measure(&body.body).unwrap()).collect();
+                // The child reference is (10,20,0) mm: its source coordinates are cm.
+                // Align it to the parent's origin, then to (100,0,0) mm turned 90 degrees.
+                let expected =
+                    [(Vec3::new(-10.0, -20.0, 0.0), Vec3::new(0.0, -10.0, 10.0)), (Vec3::new(110.0, -10.0, 0.0), Vec3::new(120.0, 0.0, 10.0))];
+                for (got, (low, high)) in boxes.iter().zip(expected) {
+                    assert!(
+                        got.bbox.min.dist(low) < 1e-6 && got.bbox.max.dist(high) < 1e-6,
+                        "child_second={child_is_second}, crossed={crossed}, shared={shared_origin}: {:?}",
+                        got.bbox
+                    );
+                    assert!(rel(got.volume, 1000.0) < 1e-9);
+                }
+                assert_eq!(imported.warnings.iter().any(|warning| warning.contains("matched by representation membership")), crossed);
+            }
+        }
+    }
+}
+
+#[test]
+fn shared_or_unlisted_item_defined_frames_keep_declared_order() {
+    for ambiguous in [false, true] {
+        let text = if ambiguous {
+            two_instance_assembly().replace("(#101,#65)", "(#101,#65,#81,#84)").replace("(#81,#84)", "(#81,#84,#65)")
+        } else {
+            two_instance_assembly().replace("(#101,#65)", "(#101)")
+        };
+        let imported = step_import(&text).unwrap();
+        assert!(imported.warnings.is_empty(), "{:?}", imported.warnings);
+        let second = measure(&imported.bodies.get(1).unwrap().body).unwrap();
+        assert!(second.bbox.min.dist(Vec3::new(90.0, 0.0, 0.0)) < 1e-6);
+        assert!(second.bbox.max.dist(Vec3::new(100.0, 10.0, 10.0)) < 1e-6);
+    }
+}
+
 /// The cube part (in cm) placed `n` times in a millimetre assembly, each instance moved along X
 /// and turned about Z.
 fn instanced_assembly(n: u64) -> String {

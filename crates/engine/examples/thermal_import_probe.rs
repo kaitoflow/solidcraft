@@ -143,6 +143,13 @@ fn probe(run: &mut Run, input: &Path, expected: &str, selected: &[usize]) -> Res
         for feature in &session.doc.features {
             if let solidcraft_doc::FeatureKind::Import { step, .. } = &feature.kind {
                 let imported = solidcraft_kernel::step_import_shared(step)?;
+                run.save(
+                    &format!("raw-import-tree-{}.json", feature.id),
+                    &json!({
+                        "feature_id":feature.id,"length_unit":"mm","placement_matrix_layout":"column_major",
+                        "placement_scope":"each_node_relative_to_parent","tree":imported.tree
+                    }),
+                )?;
                 for (index, body) in imported.bodies.iter().enumerate() {
                     let bounds = body.body.outline_bounds();
                     raw_bodies.push(json!({

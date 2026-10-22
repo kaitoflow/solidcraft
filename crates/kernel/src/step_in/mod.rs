@@ -920,10 +920,20 @@ impl Reader {
             let (u1, u2) = (self.units_of(r1), self.units_of(r2));
             if ope.name() == "ITEM_DEFINED_TRANSFORMATION" {
                 let p = ope.params();
-                let (i1, i2) = (
+                let (mut i1, mut i2) = (
                     p.get(2).and_then(Param::as_ref_id).ok_or("bad transformation")?,
                     p.get(3).and_then(Param::as_ref_id).ok_or("bad transformation")?,
                 );
+                let contains = |rep, item| self.reps.get(&rep).is_some_and(|(items, _)| items.contains(&item));
+                let declared = contains(r1, i1) && contains(r2, i2);
+                let crossed = contains(r1, i2) && contains(r2, i1);
+                if crossed && !declared {
+                    // Some exporters list the frames opposite to the relationship endpoints.
+                    // Only direct item membership, not linked representations, overrides
+                    // their order. After reassignment, units follow the relationship endpoints.
+                    std::mem::swap(&mut i1, &mut i2);
+                    self.warn("component placement frames matched by representation membership");
+                }
                 let m1 = self.placement_matrix(i1, u1)?;
                 let m2 = self.placement_matrix(i2, u2)?;
                 // rep_1 is normally the component: map its item onto the assembly's item.
